@@ -283,6 +283,7 @@ class JdSeckill(object):
         self.session = self.spider_session.get_session()
         self.user_agent = self.spider_session.user_agent
         self.nick_name = None
+        self.retry_times = 10
 
     def login_by_qrcode(self):
         """
@@ -343,27 +344,41 @@ class JdSeckill(object):
         """
         预约
         """
-        while True:
-            try:
-                self.make_reserve()
-                break
-            except Exception as e:
-                logger.info('预约发生异常!', e)
-            wait_some_time()
+        try:
+            logger.info('预约结果：' + self.make_reserve())
+        except Exception as e:
+            logger.error('预约发生异常!', e)
 
     def _seckill(self):
         """
         抢购
         """
-        while True:
-            try:
-                self.request_seckill_url()
-                while True:
-                    self.request_seckill_checkout_page()
-                    self.submit_seckill_order()
-            except Exception as e:
-                logger.info('抢购发生异常，稍后继续执行！', e)
+        '''
+        STEP 1: 等待开始时间
+        '''
+        self.timers.start() 
+     
+        '''
+        STEP 2：获取抢购信息
+        '''
+        is_request_url = self.request_seckill_url()
+        if not is_request_url:
+            logger.error("获取抢购信息失败, 抢购失败...")
+            return
+
+        '''
+        STEP 3：抢购
+        '''
+        retry_time = 3
+        try:
+            while retry_time > 0:
+                retry_time-=1
+                self.request_seckill_checkout_page()
+                self.submit_seckill_order()
+        except Exception as e:
+            logger.error('抢购发生异常，稍后继续执行！', e)
             wait_some_time()
+           
 
     def make_reserve(self):
         """商品预约"""
@@ -381,17 +396,29 @@ class JdSeckill(object):
         resp = self.session.get(url=url, params=payload, headers=headers)
         resp_json = parse_json(resp.text)
         reserve_url = resp_json.get('url')
+        resp.raise_for_status()
         self.timers.start()
-        while True:
+        retry_time = 3
+        is_reserve_ok = false
+        while retry_time > 0:
+            retry_time -= 1
             try:
-                self.session.get(url='https:' + reserve_url)
+                resp = self.session.get(url='https:' + reserve_url)
+                if resp.status_code != 200:
+                    logger.error("预约请求失败：{}, 重试中....".format( resp.status_code))
+                    continue
                 logger.info('预约成功，已获得抢购资格 / 您已成功预约过了，无需重复预约')
+                is_reserve_ok = True
                 if global_config.getRaw('messenger', 'enable') == 'true':
                     success_message = "预约成功，已获得抢购资格 / 您已成功预约过了，无需重复预约"
                     send_wechat(success_message)
                 break
             except Exception as e:
                 logger.error('预约失败正在重试...')
+
+        if not is_reserve_ok:
+            logger.error('预约失败...')
+        return is_reserve_ok
 
     def get_username(self):
         """获取用户信息"""
@@ -445,7 +472,9 @@ class JdSeckill(object):
             'Host': 'itemko.jd.com',
             'Referer': 'https://item.jd.com/{}.html'.format(self.sku_id),
         }
-        while True:
+        retry_time = 3
+        while retry_time > 0:
+            retry_time-=1
             resp = self.session.get(url=url, headers=headers, params=payload)
             resp_json = parse_json(resp.text)
             if resp_json.get('url'):
@@ -462,10 +491,11 @@ class JdSeckill(object):
                 wait_some_time()
 
     def request_seckill_url(self):
+        is_request_url_ok = False
         """访问商品的抢购链接（用于设置cookie等"""
         logger.info('用户:{}'.format(self.get_username()))
         logger.info('商品名称:{}'.format(self.get_sku_title()))
-        self.timers.start()
+        
         self.seckill_url[self.sku_id] = self.get_seckill_url()
         logger.info('访问商品的抢购连接...')
         headers = {
@@ -473,11 +503,23 @@ class JdSeckill(object):
             'Host': 'marathon.jd.com',
             'Referer': 'https://item.jd.com/{}.html'.format(self.sku_id),
         }
-        self.session.get(
-            url=self.seckill_url.get(
-                self.sku_id),
-            headers=headers,
-            allow_redirects=False)
+        try:
+            retry_time = 3
+            while(retry_time > 0):
+                retry_time -= 1
+                resp = self.session.get(
+                    url=self.seckill_url.get(
+                        self.sku_id),
+                    headers=headers,
+                    allow_redirects=False)
+                resp.raise_for_status()
+                is_request_url_ok = True
+                break
+            catch Exception as e:
+                logger.error("访问商品的抢购连接重试....")
+                wait_some_time()
+
+        return is_request_url_ok
 
     def request_seckill_checkout_page(self):
         """访问抢购订单结算页面"""
@@ -493,7 +535,8 @@ class JdSeckill(object):
             'Host': 'marathon.jd.com',
             'Referer': 'https://item.jd.com/{}.html'.format(self.sku_id),
         }
-        self.session.get(url=url, params=payload, headers=headers, allow_redirects=False)
+        resp = self.session.get(url=url, params=payload, headers=headers, allow_redirects=False)
+        resp.raise_for_status()
 
     def _get_seckill_init_info(self):
         """获取秒杀初始化信息（包括：地址，发票，token）
